@@ -7,17 +7,11 @@ on:
       - build/armsx2-128mb-arm64
     paths:
       - .github/workflows/build-armsx2-128mb.yml
-      - build/armsx2-128mb-arm64.patch
 
 jobs:
   android:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout build harness
-        uses: actions/checkout@v4
-        with:
-          path: harness
-
       - name: Checkout ARMSX2 source
         uses: actions/checkout@v4
         with:
@@ -26,8 +20,63 @@ jobs:
           submodules: recursive
           path: armsx2
 
-      - name: Apply 128MB ARM64 patch
-        run: git -C armsx2 apply ../harness/build/armsx2-128mb-arm64.patch
+      - name: Apply 128MB ARM64 source edits
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("armsx2")
+
+          p = root / "pcsx2/arm64/iR5900-arm64.cpp"
+          s = p.read_text()
+          pairs = [
+              ("static u16 manual_page[Ps2MemSize::MainRam / 4096] = {};", "static u16 manual_page[Ps2MemSize::TotalRam / 4096] = {};"),
+              ("static u8 manual_counter[Ps2MemSize::MainRam / 4096] = {};", "static u8 manual_counter[Ps2MemSize::TotalRam / 4096] = {};"),
+              ("recLutEntries = (Ps2MemSize::MainRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4;", "recLutEntries = (Ps2MemSize::ExposedRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4;"),
+              ("curpos += (Ps2MemSize::MainRam / 4);", "curpos += (Ps2MemSize::ExposedRam / 4);"),
+              ("if (recRAMCopy.size() != Ps2MemSize::MainRam)", "if (recRAMCopy.size() != Ps2MemSize::ExposedRam)"),
+              ("recRAMCopy.resize(Ps2MemSize::MainRam);", "recRAMCopy.resize(Ps2MemSize::ExposedRam);"),
+              ("Ps2MemSize::MainRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2);", "Ps2MemSize::ExposedRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2);"),
+              ("if (HWADDR(pc) <= Ps2MemSize::MainRam)", "if (HWADDR(pc) <= Ps2MemSize::ExposedRam)"),
+              ("Ps2MemSize::MainRam - oldBlock->startpc", "Ps2MemSize::ExposedRam - oldBlock->startpc"),
+          ]
+          for old, new in pairs:
+              if old not in s:
+                  raise SystemExit("missing ARM64 source pattern: " + old)
+              s = s.replace(old, new)
+
+          pattern = r"\t// Map EE RAM \(32MB, mirrored\)\n\tfor \(int i = 0; i < 0x200; i\+\+\)\n\t\{\n\t\tu32 mask = \(Ps2MemSize::MainRam / _64kb\) - 1;\n(?:\t\trecLUT_SetPage\([^\n]+\n){8}\t\}"
+          replacement = "\t// Map all exposed EE RAM (32MB retail or 128MB devkit), mirrored.\n\tfor (int i = 0; i < static_cast<int>(Ps2MemSize::ExposedRam / _64kb); i++)\n\t{\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0x0000, i, i);\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0x2000, i, i);\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0x3000, i, i);\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0x8000, i, i);\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0xa000, i, i);\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0xb000, i, i);\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0xc000, i, i);\n\t\trecLUT_SetPage(recLUT, hwLUT, recRAM, 0xd000, i, i);\n\t}"
+          s, n = re.subn(pattern, replacement, s, count=1)
+          if n != 1:
+              raise SystemExit("failed to replace ARM64 RAM map")
+
+          s = re.sub(r"\t// MainRam, deliberately[^\n]*\n\t// the recRAM advance[^\n]*\n\t// and manual_page[^\n]*\n\t// instead \(iR5900\.cpp:564-577\)\.[^\n]*\n\t// snapshots from a LUT[^\n]*\n", "\t// ARM64 recompiler RAM structures track ExposedRam, matching the x86 implementation.\n", s, count=1)
+          p.write_text(s)
+
+          p = root / "pcsx2/Memory.cpp"
+          s = p.read_text()
+          s = s.replace("u32 ExposedRam = MainRam;", "u32 ExposedRam = TotalRam;", 1)
+          s = s.replace("u32 ExposedIopRam = IopRam;", "u32 ExposedIopRam = TotalIopRam;", 1)
+          s = s.replace("static bool s_extra_memory = false;", "static bool s_extra_memory = true;", 1)
+          s, n = re.subn(r"#ifdef ARCH_ARM64\n\t// The ARM64 EE recompiler is MainRam-only:.*?#endif\n", "", s, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit("failed to remove ARM64 extended-RAM rejection")
+          marker = "void memSetExtraMemMode(bool mode)\n{"
+          if marker not in s:
+              raise SystemExit("missing memSetExtraMemMode")
+          s = s.replace(marker, marker + "\n\t// NCAA NEXT build: always expose 128MB devkit memory.\n\tmode = true;", 1)
+          p.write_text(s)
+
+          p = root / "pcsx2/Pcsx2Config.cpp"
+          s = p.read_text()
+          if "ExtraMemory = false;" not in s:
+              raise SystemExit("missing ExtraMemory default")
+          s = s.replace("ExtraMemory = false;", "ExtraMemory = true;", 1)
+          p.write_text(s)
+          PY
 
       - name: Verify patch
         run: |
