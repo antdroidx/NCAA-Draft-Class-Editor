@@ -1,0 +1,166 @@
+--- a/pcsx2/arm64/iR5900-arm64.cpp
++++ b/pcsx2/arm64/iR5900-arm64.cpp
+@@ -156,8 +156,8 @@
+ #endif
+ 
+ // Self-modifying code detection
+-static u16 manual_page[Ps2MemSize::MainRam / 4096] = {};
+-static u8 manual_counter[Ps2MemSize::MainRam / 4096] = {};
++static u16 manual_page[Ps2MemSize::TotalRam / 4096] = {};
++static u8 manual_counter[Ps2MemSize::TotalRam / 4096] = {};
+ 
+ // Forward declarations
+ static void recRecompile(const u32 startpc);
+@@ -3141,7 +3141,7 @@
+ 
+ static void recReserveRAM()
+ {
+-	recLutEntries = (Ps2MemSize::MainRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4;
++	recLutEntries = (Ps2MemSize::ExposedRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4;
+ 
+ 	if (recLutReserve_RAM.size() != recLutEntries)
+ 		recLutReserve_RAM.resize(recLutEntries);
+@@ -3150,7 +3150,7 @@
+ 
+ 	BASEBLOCK* curpos = recLutReserve_RAM.data();
+ 	recRAM = curpos;
+-	curpos += (Ps2MemSize::MainRam / 4);
++	curpos += (Ps2MemSize::ExposedRam / 4);
+ 	recROM = curpos;
+ 	curpos += (Ps2MemSize::Rom / 4);
+ 	recROM1 = curpos;
+@@ -3158,13 +3158,11 @@
+ 	recROM2 = curpos;
+ 	curpos += (Ps2MemSize::Rom2 / 4);
+ 
+-	// MainRam, deliberately — this whole rec is MainRam-only: recLutEntries and
+-	// the recRAM advance above, the (MainRam / _64kb) alias mask in recResetRaw,
+-	// and manual_page / manual_counter. Upstream x86 uses ExposedRam throughout
+-	// instead (iR5900.cpp:564-577). Widening this buffer alone would desync the
+-	// snapshots from a LUT that aliases high RAM back into the low 32 MB.
+-	if (recRAMCopy.size() != Ps2MemSize::MainRam)
+-		recRAMCopy.resize(Ps2MemSize::MainRam);
++	// Keep the ARM64 snapshot/LUT span synchronized with the amount of EE RAM
++	// exposed to the guest. This mirrors the x86 recompiler and is required for
++	// executing blocks from the 32-128MB devkit region.
++	if (recRAMCopy.size() != Ps2MemSize::ExposedRam)
++		recRAMCopy.resize(Ps2MemSize::ExposedRam);
+ }
+ 
+ static void recReserve()
+@@ -3278,7 +3276,7 @@
+ 	Console.WriteLn(Color_Green, "EE ARM64: Dispatcher generated at %p (%zu bytes)", dispStart, (size_t)(dispEnd - dispStart));
+ 
+ 	iopClearRecLUT(recLutReserve_RAM.data(),
+-		Ps2MemSize::MainRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2);
++		Ps2MemSize::ExposedRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2);
+ 
+ 	BASEBLOCK* unmapped = recLutUnmapped.data();
+ 
+@@ -3288,18 +3286,17 @@
+ 	for (int i = 0; i < _64kb / 4; i++)
+ 		unmapped[i].SetFnptr((uptr)UnmappedRecLUTPage);
+ 
+-	// Map EE RAM (32MB, mirrored)
+-	for (int i = 0; i < 0x200; i++)
++	// Map all exposed EE RAM (32MB retail or 128MB devkit), mirrored.
++	for (int i = 0; i < static_cast<int>(Ps2MemSize::ExposedRam / _64kb); i++)
+ 	{
+-		u32 mask = (Ps2MemSize::MainRam / _64kb) - 1;
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x0000, i, i & mask);
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x2000, i, i & mask);
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x3000, i, i & mask);
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x8000, i, i & mask);
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xa000, i, i & mask);
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xb000, i, i & mask);
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xc000, i, i & mask);
+-		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xd000, i, i & mask);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x0000, i, i);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x2000, i, i);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x3000, i, i);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0x8000, i, i);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xa000, i, i);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xb000, i, i);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xc000, i, i);
++		recLUT_SetPage(recLUT, hwLUT, recRAM, 0xd000, i, i);
+ 	}
+ 
+ 	// Map BIOS ROM
+@@ -4400,7 +4397,7 @@
+ 	// mismatched and recompile-looped — which is why this was disabled; the
+ 	// old-block-region compare is the correct x86 semantics
+ 	// (OverlapWalkIgnoresUnmodifiedNeighbors pins the no-false-positive side).
+-	if (HWADDR(pc) <= Ps2MemSize::MainRam)
++	if (HWADDR(pc) <= Ps2MemSize::ExposedRam)
+ 	{
+ 		BASEBLOCKEX* oldBlock;
+ 		int i = recBlocks.LastIndex(HWADDR(pc) - 4);
+@@ -4430,7 +4427,7 @@
+ 			// the compare never matches — each then recClears the other
+ 			// forever. Clamp keeps a block straddling the top of RAM in bounds.
+ 			const u32 cmplen = std::min<u32>(oldBlock->size * 4,
+-				Ps2MemSize::MainRam - oldBlock->startpc);
++				Ps2MemSize::ExposedRam - oldBlock->startpc);
+ 			if (memcmp(&recRAMCopy[oldBlock->startpc], PSM(oldBlock->startpc), cmplen))
+ 			{
+ 				recClear(startpc, (pc - startpc) / 4);
+--- a/pcsx2/Memory.cpp
++++ b/pcsx2/Memory.cpp
+@@ -55,8 +55,8 @@
+ 
+ namespace Ps2MemSize
+ {
+-	u32 ExposedRam = MainRam;
+-	u32 ExposedIopRam = IopRam;
++	u32 ExposedRam = TotalRam;
++	u32 ExposedIopRam = TotalIopRam;
+ } // namespace Ps2MemSize
+ 
+ namespace SysMemory
+@@ -83,7 +83,7 @@
+ static bool s_ba_command_executing = false;
+ static bool s_ba_error_detected = false;
+ static u16 s_ba_current_reg = 0;
+-static bool s_extra_memory = false;
++static bool s_extra_memory = true;
+ 
+ namespace HostMemoryMap
+ {
+@@ -401,23 +401,10 @@
+ 
+ void memSetExtraMemMode(bool mode)
+ {
+-#ifdef ARCH_ARM64
+-	// The ARM64 EE recompiler is MainRam-only: its LUT loop, recLutEntries, the
+-	// recRAM advance, the alias mask and the manual_page/manual_counter arrays are
+-	// all sized to Ps2MemSize::MainRam, where the x86 rec sizes the same things to
+-	// ExposedRam. Pages 0x0200-0x1FFF therefore keep the unmapped default, and
+-	// dispatching into one lands on UnmappedRecLUTPage -> recError. Converting all
+-	// of them together is real work and has to happen as one change (c4d0a8a47c
+-	// spells out why); until it does, refuse the setting at the seam rather than
+-	// let a user-selectable option fail as a recError deep inside a game. The
+-	// interpreter handles the 128MB map fine, so gate on the recompiler only.
+-	if (mode && EmuConfig.Cpu.Recompiler.EnableEE)
+-	{
+-		Console.Warning("Extended RAM (128MB) is not supported by the ARM64 EE recompiler; ignoring it. "
+-						"Disable the EE recompiler if you need it.");
+-		mode = false;
+-	}
+-#endif
+-
++	// NCAA NEXT build: always expose devkit memory.
++	mode = true;
+ 	s_extra_memory = mode;
+ 
+ 	// update the amount of RAM exposed to the VM
+--- a/pcsx2/Pcsx2Config.cpp
++++ b/pcsx2/Pcsx2Config.cpp
+@@ -622,7 +622,7 @@
+ 
+ 	VU0FPCR = DEFAULT_VU_FP_CONTROL_REGISTER;
+ 	VU1FPCR = DEFAULT_VU_FP_CONTROL_REGISTER;
+-	ExtraMemory = false;
++	ExtraMemory = true;
+ }
+ 
+ void Pcsx2Config::CpuOptions::ApplySanityCheck()
